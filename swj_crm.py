@@ -12,10 +12,14 @@ Credentials come from the environment only, never from arguments or files in a r
   SWJ_CRM_EMAIL, SWJ_CRM_PASSWORD   the "skills" team login
   SWJ_CRM_URL, SWJ_CRM_KEY          optional; default to the public project URL and publishable key
 
-Commands (all print JSON to stdout; exit 0 ok, 1 error, 2 a batch with at least one failed write):
+Commands (all print JSON to stdout; exit 0 ok, 1 error, 2 a batch with at least one failed write).
+A failed write names its error: "exists" (set on an id already there), "missing parent" (the row points at a role or
+client that is not in the CRM; nothing was written), "not found", "version conflict". A write that could not keep a
+field (a table with no extra column) lists it under "dropped":
   swj_crm.py whoami
   swj_crm.py schema [collection]
   swj_crm.py get <collection> <id> [<id> ...]              not found: {"id":..., "found": false}
+                   (ids may be written collection/id: get runs/control runs/bd-2026-11-09)
   swj_crm.py query <collection> [--where '[["status","in",["Drafted","Awaiting reply"]], ["owner","eq","Steven"]]']
                    [--order nextDate | --order -createdAt] [--limit N] [--select f1,f2] [--out FILE]
   swj_crm.py list <collection> [--limit N] [--out FILE]      whole table (clients, team); paged
@@ -24,6 +28,7 @@ Commands (all print JSON to stdout; exit 0 ok, 1 error, 2 a batch with at least 
   swj_crm.py upsert <collection> <id> --data '{...}'        create or merge (runs docs, control flags)
   swj_crm.py delete <collection> <id> [--if-version V]
   swj_crm.py batch <file.json>      [{"op":"set|update|upsert|delete","collection":..,"id":..,"data":{..},"ifVersion":..}, ...]
+                   (new clients are written first, then new roles, then the rest in file order; results keep file order)
   swj_crm.py today | workday is <YYYY-MM-DD> | workday add <YYYY-MM-DD> <n>   England and Wales working days
 
 Where operators: eq ne in not-in lt lte gt gte like ilike contains (text[] has the value) is-null not-null.
@@ -191,6 +196,45 @@ def split_ref(collection, doc_id):
     return collection, doc_id
 
 
+def get_refs(collection, ids):
+    """Arguments of get -> (collection, [ids]). Every id may be written 'collection/id', so
+    'get runs/control runs/bd-2026-11-09' and 'get runs control bd-2026-11-09' read the same two docs.
+    One collection per call: a second collection is an error, never a silent 'found: false'."""
+    out = []
+    if "/" in collection:
+        collection, first = collection.split("/", 1)
+        out.append(first)
+    table = table_for(collection)
+    for i in ids:
+        if "/" in i:
+            c, rest = i.split("/", 1)
+            if c in COLLECTIONS or c in TABLES:
+                if table_for(c) != table:
+                    raise SystemExit(err(f"get reads one collection per call: {collection!r} and {c!r} were both given"))
+                i = rest
+        out.append(i)
+    return collection, out
+
+
+PARENT_RANK = {"clients": 0, "roles": 1}  # rows other rows point at: created first in a batch
+
+
+def batch_order(writes):
+    """Order a batch runs in: new clients first, then new roles, then everything else as given, so a row
+    and the client or role it points at can be created in one batch in any order without 'missing parent'.
+    Returns indexes into writes; results are still reported in the order the file gave."""
+    def rank(i):
+        w = writes[i] if isinstance(writes[i], dict) else {}
+        if w.get("op") in ("set", "upsert"):
+            try:
+                c, _ = split_ref(str(w.get("collection") or ""), w.get("id"))
+                return PARENT_RANK.get(table_for(c), 2)
+            except SystemExit:
+                return 2
+        return 2
+    return sorted(range(len(writes)), key=lambda i: (rank(i), i))
+
+
 def column_for(table, field):
     r = RENAME.get(table, {})
     if field in r:
@@ -281,8 +325,9 @@ def money(v):
     return None, s
 
 
-def to_row(table, doc, existing_extra=None, for_insert=False):
-    """camelCase document -> table row. Unknown fields merge into extra. Blank known fields become null."""
+def to_row(table, doc, existing_extra=None, for_insert=False, dropped=None):
+    """camelCase document -> table row. Unknown fields merge into extra. Blank known fields become null.
+    On a table with no extra column an unknown field cannot be kept: its name is added to `dropped`."""
     cols = TABLES[table]
     row, extra = {}, dict(existing_extra or {})
     src = {k: v for k, v in doc.items() if k not in ("id", "_version", "_table")}
@@ -317,6 +362,8 @@ def to_row(table, doc, existing_extra=None, for_insert=False):
                 extra.pop(key)
             elif not blank(val):
                 extra[key] = val
+                if "extra" not in cols and dropped is not None:
+                    dropped.append(key)
     if "extra" in cols and (extra or existing_extra is not None or for_insert):
         row["extra"] = extra
     if for_insert:
@@ -344,7 +391,8 @@ def from_row(table, row):
         name = rev.get(col, camel(col))
         doc[name] = val
     for k, v in (row.get("extra") or {}).items():
-        doc.setdefault(k, v)
+        if doc.get(k) is None:  # an extra value fills a missing or empty column of the same name (contacts.salary "Negotiable")
+            doc[k] = v
     return doc
 
 
@@ -545,16 +593,31 @@ def write_one(client, op, collection, doc_id, data, if_version=None):
     data = data or {}
     if table == "runs" and op in ("set", "upsert", "update") and doc_id is None:
         return {"ok": False, "error": "runs needs an id"}
+    dropped = []
+
+    def done(res):  # every successful write says which fields it could not keep
+        if dropped:
+            res["dropped"] = sorted(set(dropped))
+        return res
+
     if op == "set":
-        row = to_row(table, data, for_insert=True)
+        row = to_row(table, data, for_insert=True, dropped=dropped)
         if doc_id:
             row["id"] = doc_id
         status, payload, _ = client.rest("POST", table, None, row, prefer="return=representation")
         if status == 409:
-            return {"ok": False, "op": op, "collection": collection, "id": doc_id, "error": "exists", "detail": (payload or {}).get("message")}
+            p = payload if isinstance(payload, dict) else {}
+            code, message = str(p.get("code") or ""), str(p.get("message") or "")
+            if code == "23503" or "foreign key" in message.lower():
+                # the row points at a role or client that is not in the CRM: nothing was written
+                return {"ok": False, "op": op, "collection": collection, "id": doc_id, "error": "missing parent",
+                        "detail": p.get("details") or message}
+            if code in ("23505", "") or "duplicate key" in message.lower():
+                return {"ok": False, "op": op, "collection": collection, "id": doc_id, "error": "exists", "detail": message}
+            return {"ok": False, "op": op, "collection": collection, "id": doc_id, "error": "insert failed", "status": status, "detail": payload}
         if status not in (200, 201):
             return {"ok": False, "op": op, "collection": collection, "id": doc_id, "error": "insert failed", "status": status, "detail": payload}
-        return {"ok": True, "op": op, "collection": collection, "id": payload[0]["id"], "version": payload[0].get("updated_at")}
+        return done({"ok": True, "op": op, "collection": collection, "id": payload[0]["id"], "version": payload[0].get("updated_at")})
     if op == "upsert":
         current = read_one(client, table, doc_id)
         if current is None:
@@ -572,21 +635,24 @@ def write_one(client, op, collection, doc_id, data, if_version=None):
             merged.update({k: v for k, v in data.items() if k not in ("id", "_version")})
             row = {"data": merged}
         else:
-            row = to_row(table, data, existing_extra=current.get("extra") if "extra" in TABLES[table] else None)
+            row = to_row(table, data, existing_extra=current.get("extra") if "extra" in TABLES[table] else None, dropped=dropped)
             row.pop("id", None)
         if not row:
-            return {"ok": True, "op": op, "collection": collection, "id": doc_id, "version": current.get("updated_at"), "unchanged": True}
+            return done({"ok": True, "op": op, "collection": collection, "id": doc_id, "version": current.get("updated_at"), "unchanged": True})
         params = [("id", f"eq.{doc_id}")]
         if "updated_at" in TABLES[table] and current.get("updated_at"):
             params.append(("updated_at", f"eq.{current['updated_at']}"))
         status, payload, _ = client.rest("PATCH", table, params, row, prefer="return=representation")
+        if status == 409 and isinstance(payload, dict) and (str(payload.get("code")) == "23503" or "foreign key" in str(payload.get("message", "")).lower()):
+            return {"ok": False, "op": op, "collection": collection, "id": doc_id, "error": "missing parent",
+                    "detail": payload.get("details") or payload.get("message")}
         if status not in (200, 204):
             return {"ok": False, "op": op, "collection": collection, "id": doc_id, "error": "update failed", "status": status, "detail": payload}
         if not payload:
             latest = read_one(client, table, doc_id)
             return {"ok": False, "op": op, "collection": collection, "id": doc_id, "error": "version conflict",
                     "current": from_row(table, latest) if latest else None}
-        return {"ok": True, "op": op, "collection": collection, "id": doc_id, "version": payload[0].get("updated_at")}
+        return done({"ok": True, "op": op, "collection": collection, "id": doc_id, "version": payload[0].get("updated_at")})
     if op == "delete":
         params = [("id", f"eq.{doc_id}")]
         if if_version and "updated_at" in TABLES[table]:
@@ -681,8 +747,7 @@ def main(argv):
         print(json.dumps({"signedInAs": client.email, "team": payload}))
         return 0
     if a.cmd == "get":
-        collection, first = split_ref(a.collection, a.ids[0] if a.ids else None)
-        ids = [first] + a.ids[1:] if first else a.ids
+        collection, ids = get_refs(a.collection, a.ids)
         table = table_for(collection)
         if not ids:
             print(err("get needs at least one id")); return 1
@@ -717,17 +782,21 @@ def main(argv):
             writes = json.load(f)
         if not isinstance(writes, list):
             print(err("batch file must hold a list of writes")); return 1
-        results = []
-        for w in writes:
+        results = [None] * len(writes)
+        for i in batch_order(writes):  # parents first; results keep the file's order
+            w = writes[i]
+            if not isinstance(w, dict):
+                results[i] = {"ok": False, "error": "each write must be an object"}
+                continue
             try:
-                results.append(write_one(client, w.get("op"), w.get("collection"), w.get("id"), w.get("data"), w.get("ifVersion")))
+                results[i] = write_one(client, w.get("op"), w.get("collection"), w.get("id"), w.get("data"), w.get("ifVersion"))
             except SystemExit as e:  # a bad value or unknown collection in one write must not abort the rest
                 detail = e.code if isinstance(e.code, str) else str(e.code)
                 try:
                     detail = json.loads(detail).get("error", detail)
                 except (ValueError, AttributeError):
                     pass
-                results.append({"ok": False, "op": w.get("op"), "collection": w.get("collection"), "id": w.get("id"), "error": detail})
+                results[i] = {"ok": False, "op": w.get("op"), "collection": w.get("collection"), "id": w.get("id"), "error": detail}
         ok = sum(1 for r in results if r.get("ok"))
         print(json.dumps({"ok": ok, "failed": len(results) - ok, "results": results}, ensure_ascii=False))
         return 0 if ok == len(results) else 2
