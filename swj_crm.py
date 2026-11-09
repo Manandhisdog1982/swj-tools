@@ -717,7 +717,17 @@ def main(argv):
             writes = json.load(f)
         if not isinstance(writes, list):
             print(err("batch file must hold a list of writes")); return 1
-        results = [write_one(client, w.get("op"), w.get("collection"), w.get("id"), w.get("data"), w.get("ifVersion")) for w in writes]
+        results = []
+        for w in writes:
+            try:
+                results.append(write_one(client, w.get("op"), w.get("collection"), w.get("id"), w.get("data"), w.get("ifVersion")))
+            except SystemExit as e:  # a bad value or unknown collection in one write must not abort the rest
+                detail = e.code if isinstance(e.code, str) else str(e.code)
+                try:
+                    detail = json.loads(detail).get("error", detail)
+                except (ValueError, AttributeError):
+                    pass
+                results.append({"ok": False, "op": w.get("op"), "collection": w.get("collection"), "id": w.get("id"), "error": detail})
         ok = sum(1 for r in results if r.get("ok"))
         print(json.dumps({"ok": ok, "failed": len(results) - ok, "results": results}, ensure_ascii=False))
         return 0 if ok == len(results) else 2
